@@ -1,5 +1,6 @@
 # music_player/cli/commands.py
 
+import shutil
 from pathlib import Path
 from core.player import Player
 from core.library import Library
@@ -8,6 +9,14 @@ from core.downloader import download_mp3
 
 
 class Commands:
+    # Tri autorisé pour list_tracks : whitelist fixe (pas de SQL injecté via `sort`)
+    _TRACK_SORT_SQL = {
+        "id":     "id",                                    # ordre d'ajout brut (défaut historique)
+        "title":  "title COLLATE NOCASE",                   # alphabétique
+        "artist": "artist COLLATE NOCASE, title COLLATE NOCASE",
+        "recent": "id DESC",                                 # derniers ajouts en premier
+    }
+
     def __init__(self, library: Library, player: Player):
         self.library = library
         self.player = player
@@ -19,9 +28,10 @@ class Commands:
             return
         self.library.add_folder(Path(args[0]))
 
-    def list_tracks(self):
+    def list_tracks(self, sort="id"):
+        order = self._TRACK_SORT_SQL.get(sort, "id")
         cursor = self.library.conn.cursor()
-        cursor.execute("SELECT id, title, artist, album, path FROM tracks ORDER BY id")
+        cursor.execute(f"SELECT id, title, artist, album, path FROM tracks ORDER BY {order}")
         return [
             {"id": r["id"], "title": r["title"], "artist": r["artist"],
              "album": r["album"], "path": Path(r["path"])}
@@ -62,6 +72,20 @@ class Commands:
     def sync_library(self):
         """Supprime les tracks dont le fichier n'existe plus sur disque."""
         return self.library.sync_missing_tracks()
+
+    def export_tracks(self, tracks, dest_folder: Path):
+        """Copie les fichiers des tracks donnés vers dest_folder.
+        Retourne (nb_copiés, nb_échecs)."""
+        dest_folder = Path(dest_folder)
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        copied, failed = 0, 0
+        for t in tracks:
+            try:
+                shutil.copy2(t["path"], dest_folder / Path(t["path"]).name)
+                copied += 1
+            except Exception:
+                failed += 1
+        return copied, failed
 
     # ---------------- PLAYER CONTROL ---------------- #
 

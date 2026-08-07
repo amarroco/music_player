@@ -1,6 +1,7 @@
 # music_player/cli/ui.py
 
 import curses
+import random
 import time
 from cli.commands import Commands
 from core.library import Library
@@ -16,8 +17,14 @@ CONTROL_ACTIONS = [
     ("prev",     "Prev Track",     "/"),
     ("seek_fwd", "Seek +10s",      "l"),
     ("seek_bwd", "Seek -10s",      "j"),
+    ("sort",     "Cycle Sort",     "s"),
+    ("search",   "Search Tracks",  "f"),
     ("quit",     "Quit",           "q"),
 ]
+
+# Modes de tri disponibles pour la liste des tracks (touche "sort")
+TRACK_SORT_MODES = ["title", "artist", "recent", "random"]
+TRACK_SORT_LABELS = {"title": "Title", "artist": "Artist", "recent": "Recent", "random": "Random"}
 
 
 def key_display(char: str) -> str:
@@ -44,13 +51,16 @@ class UI:
         self.scroll_offset = 0       # premier item visible dans le menu
         self.active_playlist = None
         self.items = []
+        self.track_sort = "title"    # cf. TRACK_SORT_MODES
+        self.track_filter = ""       # filtre de recherche courant (tracks)
+        self._random_order = []      # ordre figé pour le tri "random" (liste d'ids)
         self.input_buffer = ""
         self.selection_items = []
         self.selection_callback = None
         self.stdscr = None
         self.first_launch = False
         self._controls: dict = {}
-        self._menu_visible_rows = 0  # mis à jour dans draw_menu_box
+        self._menu_visible_rows = 0  # cf. _visible_rows(), recalculé à chaque frame
 
     # ---------------- CONTROLS ---------------- #
 
@@ -79,23 +89,32 @@ class UI:
     def main_loop(self, stdscr):
         self.stdscr = stdscr
         curses.curs_set(0)
-        stdscr.nodelay(True)
-        stdscr.timeout(100)
+        stdscr.nodelay(True)  # getch() ne bloque jamais
         self._load_controls()
+        self.track_sort = self.library.get_setting("track_sort") or "title"
+        if self.track_sort not in TRACK_SORT_MODES:
+            self.track_sort = "title"
 
         if self.first_launch:
             self.state = "settings"
             self.first_launch = False
 
         while self.running:
+            # On vide entièrement le buffer clavier à chaque frame : si une
+            # touche a été maintenue (auto-repeat), toutes ses répétitions
+            # sont traitées immédiatement au lieu de s'accumuler et de
+            # continuer à scroller après le relâchement de la touche.
+            key = self.stdscr.getch()
+            while key != -1:
+                self.handle_key(key)
+                key = self.stdscr.getch()
+
+            self.player.check_auto_next()
             self.stdscr.clear()
             h, w = self.stdscr.getmaxyx()
             self.render_current_state(h, w)
             self.stdscr.refresh()
-            key = self.stdscr.getch()
-            self.handle_key(key)
-            self.player.check_auto_next()
-            time.sleep(0.05)
+            time.sleep(0.03)
 
     # ---------------- RENDER ---------------- #
 
@@ -105,28 +124,55 @@ class UI:
     def render_current_state(self, h, w):
         shortcuts_h = 4 if self._shortcuts_visible() else 0
         self.draw_current_track_box(0, 0, 5, w)
+
+        # Items d'abord : draw_menu_box et _clamp_scroll doivent voir la
+        # liste à jour de cette frame, jamais celle de l'état précédent.
+        self._refresh_items()
+
+        if self.items:
+            self.selected_index = max(0, min(self.selected_index, len(self.items) - 1))
+        else:
+            self.selected_index = 0
+
         # La box menu occupe tout l'espace entre le track et le bas
         menu_y = 6
         menu_h = h - menu_y - shortcuts_h
+        self._menu_visible_rows = self._visible_rows(menu_h, len(self.items))
+        self._clamp_scroll()
+
         self.draw_menu_box(menu_y, 0, menu_h, w)
         if shortcuts_h:
             self.draw_shortcuts_box(h - shortcuts_h, 0, shortcuts_h, w)
 
-        # Remplir items selon l'état
+    def _refresh_items(self):
+        """Remplit self.items selon l'état courant (tri/filtre pour les tracks)."""
         if self.state == "main":
-            self.items = ["Tracks", "Playlists", "Settings", "Quit"]
+            self.items = ["Tracks", "Playlists", "Export", "Settings", "Quit"]
         elif self.state == "tracks":
-            self.items = self.cmds.list_tracks()
+            db_sort = "id" if self.track_sort == "random" else self.track_sort
+            tracks = self.cmds.list_tracks(sort=db_sort)
+            if self.track_sort == "random":
+                tracks = self._shuffled(tracks)
+            if self.track_filter:
+                q = self.track_filter.lower()
+                tracks = [
+                    t for t in tracks
+                    if q in t["title"].lower() or (t["artist"] and q in t["artist"].lower())
+                ]
+            self.items = tracks
         elif self.state == "playlists":
             self.items = self.cmds.list_playlists()
         elif self.state == "playlist_internal" and self.active_playlist:
             self.items = self.cmds.playlist_tracks(self.active_playlist["id"])
         elif self.state == "settings":
             music_folder = self.library.get_setting("music_folder") or "Not configured"
+            export_folder = self.library.get_setting("export_folder") or "Not configured"
             sc = "ON" if self._shortcuts_visible() else "OFF"
             self.items = [
                 f"Music Folder: {music_folder}",
                 "Change Music Folder",
+                f"Export Folder: {export_folder}",
+                "Change Export Folder",
                 f"Show Shortcuts: {sc}",
                 "Controls",
                 "Back to Main Menu",
@@ -141,20 +187,35 @@ class UI:
         elif self.state == "selection":
             self.items = self.selection_items
 
-        # Clamp selected_index
-        if self.items:
-            self.selected_index = max(0, min(self.selected_index, len(self.items) - 1))
-        else:
-            self.selected_index = 0
-
-        # Maintenir le scroll pour garder l'item sélectionné visible
-        self._clamp_scroll()
+    def _shuffled(self, tracks):
+        """Applique un ordre aléatoire STABLE d'une frame à l'autre (sinon la
+        liste se remélangerait à chaque redraw, ~30x/s, et rendrait toute
+        sélection impossible). Le mélange n'est régénéré que si la touche
+        sort re-sélectionne "random" (_cycle_track_sort) ou si le set de
+        tracks a changé (ajout/suppression) depuis le dernier mélange."""
+        ids = {t["id"] for t in tracks}
+        if not self._random_order or set(self._random_order) != ids:
+            self._random_order = [t["id"] for t in tracks]
+            random.shuffle(self._random_order)
+        by_id = {t["id"]: t for t in tracks}
+        return [by_id[i] for i in self._random_order]
 
     # ---------------- SCROLL ---------------- #
 
+    @staticmethod
+    def _visible_rows(box_h, n):
+        """Nombre de lignes dispo pour les items dans une box de hauteur box_h.
+        Si la liste ne tient pas, on réserve 1 ligne en haut + 1 en bas pour
+        les indicateurs "...", de façon FIXE (indépendante du scroll actuel).
+        C'est ce point qui garantit que le dessin et le clamp du scroll
+        s'accordent toujours sur le même nombre de lignes."""
+        interior = max(0, box_h - 2)
+        reserved = 2 if n > interior else 0
+        return max(1, interior - reserved)
+
     def _clamp_scroll(self):
         """Ajuste scroll_offset pour que selected_index reste dans la zone visible."""
-        vis = max(1, self._menu_visible_rows)
+        vis = self._menu_visible_rows
         if self.selected_index < self.scroll_offset:
             self.scroll_offset = self.selected_index
         elif self.selected_index >= self.scroll_offset + vis:
@@ -164,6 +225,20 @@ class UI:
         self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
 
     # ---------------- BOXES ---------------- #
+
+    def _safe_addstr(self, y, x, text, attr=0):
+        try:
+            self.stdscr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+    def _menu_title(self):
+        if self.state != "tracks":
+            return "Menu"
+        title = f"Tracks: {TRACK_SORT_LABELS[self.track_sort]}"
+        if self.track_filter:
+            title += f' | "{self.track_filter}"'
+        return title
 
     def draw_box(self, y, x, h, w, title=None):
         try:
@@ -184,45 +259,38 @@ class UI:
         bar_len = max(w - 10, 10)
         progress = int((pos / dur) * bar_len) if dur else 0
         bar = "[" + "#" * progress + "-" * (bar_len - progress) + "]"
-        try:
-            self.stdscr.addstr(y + 1, x + 2, track.stem if track else "No track playing")
-            self.stdscr.addstr(y + 2, x + 2, bar)
-            self.stdscr.addstr(
-                y + 3, x + 2,
-                f"{int(pos)//60}:{int(pos)%60:02d} / {int(dur)//60}:{int(dur)%60:02d}",
-            )
-        except curses.error:
-            pass
+
+        vol = self.player.current_volume()
+        vol_bar = "#" * (vol // 10) + "-" * (10 - vol // 10)
+        pos_str = f"{int(pos)//60}:{int(pos)%60:02d} / {int(dur)//60}:{int(dur)%60:02d}"
+        info_line = f"{pos_str}    Vol [{vol_bar}] {vol:3d}%"
+
+        self._safe_addstr(y + 1, x + 2, track.stem if track else "No track playing")
+        self._safe_addstr(y + 2, x + 2, bar)
+        self._safe_addstr(y + 3, x + 2, info_line[:w - 4])
 
     def draw_menu_box(self, y, x, h, w):
-        self.draw_box(y, x, h, w, "Menu")
-
-        interior_rows = h - 2          # lignes disponibles entre les bordures
-        self._menu_visible_rows = interior_rows
+        self.draw_box(y, x, h, w, self._menu_title())
 
         n = len(self.items)
         if n == 0:
+            if self.state == "tracks" and self.track_filter:
+                self._safe_addstr(y + 1, x + 2, f"No matches for '{self.track_filter}'")
             return
 
-        need_top_dots = self.scroll_offset > 0
-        need_bot_dots = (self.scroll_offset + interior_rows) < n
+        # Nombre de lignes réellement dispo, déjà calculé dans
+        # render_current_state() via _visible_rows() : c'est la même valeur
+        # qu'a utilisée _clamp_scroll(), donc l'item sélectionné est
+        # toujours dans la zone qu'on s'apprête à dessiner ici.
+        items_rows = self._menu_visible_rows
+        scrollable = n > items_rows
+        draw_row = y + 1
 
-        # Si on affiche des "...", on réserve une ligne pour eux
-        top_reserve = 1 if need_top_dots else 0
-        bot_reserve = 1 if need_bot_dots else 0
-        items_rows = interior_rows - top_reserve - bot_reserve
-
-        draw_row = y + 1  # première ligne intérieure
-
-        # "..." en haut
-        if need_top_dots:
-            try:
-                self.stdscr.addstr(draw_row, x + 2, ". . .")
-            except curses.error:
-                pass
+        if scrollable:
+            if self.scroll_offset > 0:
+                self._safe_addstr(draw_row, x + 2, ". . .")
             draw_row += 1
 
-        # Items visibles
         for i in range(items_rows):
             idx = self.scroll_offset + i
             if idx >= n:
@@ -237,19 +305,12 @@ class UI:
             max_name = w - 5
             if len(name) > max_name:
                 name = name[:max_name - 1] + "…"
-            try:
-                attr = curses.A_REVERSE if idx == self.selected_index else 0
-                self.stdscr.addstr(draw_row, x + 2, name, attr)
-            except curses.error:
-                pass
+            attr = curses.A_REVERSE if idx == self.selected_index else 0
+            self._safe_addstr(draw_row, x + 2, name, attr)
             draw_row += 1
 
-        # "..." en bas
-        if need_bot_dots:
-            try:
-                self.stdscr.addstr(draw_row, x + 2, ". . .")
-            except curses.error:
-                pass
+        if scrollable and (self.scroll_offset + items_rows) < n:
+            self._safe_addstr(draw_row, x + 2, ". . .")
 
     def draw_shortcuts_box(self, y, x, h, w):
         if self.state == "input_prompt":
@@ -264,14 +325,19 @@ class UI:
             f"{c('vol_up')}/{c('vol_down')}-vol | {c('prev')}/{c('next')}-prev/next | "
             f"{c('seek_bwd')}/{c('seek_fwd')} ±10s"
         )
-        menu_line = {
-            "tracks":           "ENTER-play | X-delete | D-download",
-            "playlists":        "ENTER-play | O-open | C-create | X-delete",
-            "playlist_internal":"ENTER-play | X-remove | A-add track",
-            "settings":         "ENTER-select",
-            "controls":         "ENTER-remap key",
-            "selection":        "Arrows + ENTER to select",
-        }.get(self.state, "")
+        if self.state == "tracks":
+            menu_line = (
+                f"ENTER-play | X-delete | D-download | E-edit | "
+                f"{c('sort')}-sort | {c('search')}-search"
+            )
+        else:
+            menu_line = {
+                "playlists":        "ENTER-play | O-open | C-create | X-delete",
+                "playlist_internal":"ENTER-play | X-remove | A-add track",
+                "settings":         "ENTER-select",
+                "controls":         "ENTER-remap key",
+                "selection":        "Arrows + ENTER to select",
+            }.get(self.state, "")
 
         try:
             self.stdscr.addstr(y + 1, x + 2, global_line[:w - 4])
@@ -330,6 +396,8 @@ class UI:
 
     def _handle_backspace(self):
         """Gère le retour arrière selon l'état courant."""
+        if self.state == "tracks":
+            self.track_filter = ""
         if self.state == "playlist_internal":
             self.state = "playlists"
         elif self.state == "controls":
@@ -349,19 +417,51 @@ class UI:
     # ---------------- STATES ---------------- #
 
     def handle_state_main(self, key):
-        if key in (10, 13):
-            targets = ["tracks", "playlists", "settings", None]
-            target = targets[self.selected_index] if self.selected_index < len(targets) else None
-            if target:
-                self.state = target
-            else:
-                self.running = False
-                self.player.stop()
+        if key not in (10, 13):
+            return
+        targets = ["tracks", "playlists", "export", "settings", None]
+        target = targets[self.selected_index] if self.selected_index < len(targets) else None
+        if target == "export":
+            self._export_tracks()
+        elif target:
+            self.state = target
             self.selected_index = 0
             self.scroll_offset = 0
+        else:
+            self.running = False
+            self.player.stop()
+
+    def _export_tracks(self):
+        """Copie tous les tracks de la bibliothèque vers le dossier d'export configuré."""
+        target_root = self.library.get_setting("export_folder")
+        if not target_root:
+            self.prompt_input("No export folder set (see Settings). Press Enter to continue.")
+            return
+        tracks = self.cmds.list_tracks()
+        if not tracks:
+            self.prompt_input("No tracks to export. Press Enter to continue.")
+            return
+        dest = Path(target_root).expanduser()
+        copied, failed = self.cmds.export_tracks(tracks, dest)
+        msg = f"Exported {copied} track(s) to {dest}"
+        if failed:
+            msg += f" ({failed} failed)"
+        self.prompt_input(f"{msg}. Press Enter to continue.")
 
     def handle_state_tracks(self, key):
-        tracks = self.cmds.list_tracks()
+        if key == self._ctrl("sort"):
+            self._cycle_track_sort()
+            return
+        if key == self._ctrl("search"):
+            self.track_filter = self.prompt_input("Search: ").strip()
+            self.selected_index = 0
+            self.scroll_offset = 0
+            return
+
+        # self.items est déjà la liste triée/filtrée de cette frame : on
+        # l'utilise directement pour que l'action porte sur le morceau
+        # réellement affiché et sélectionné à l'écran.
+        tracks = self.items
         if not tracks:
             return
         if key in (10, 13):
@@ -377,6 +477,37 @@ class UI:
             url = self.prompt_input("YouTube URL: ")
             if url:
                 self.cmds.download_youtube(url)
+        elif key in (ord("e"), ord("E")):
+            self._edit_track(tracks[self.selected_index])
+
+    def _edit_track(self, track):
+        """Édite titre / artiste / cover d'un mp3 (laisser vide = ne pas changer)."""
+        title = self.prompt_input(f"Title [{track['title']}]: ")
+        artist = self.prompt_input(f"Artist [{track['artist'] or ''}]: ")
+        cover = self.prompt_input("Cover image path (empty = keep current): ")
+
+        updates = {}
+        if title:
+            updates["title"] = title
+        if artist:
+            updates["artist"] = artist
+        if cover:
+            cover_path = Path(cover).expanduser()
+            if cover_path.exists():
+                updates["cover"] = str(cover_path)
+            else:
+                self.prompt_input("Cover file not found, skipped. Press Enter to continue.")
+        if updates:
+            self.cmds.edit_track(track["id"], updates)
+
+    def _cycle_track_sort(self):
+        i = (TRACK_SORT_MODES.index(self.track_sort) + 1) % len(TRACK_SORT_MODES)
+        self.track_sort = TRACK_SORT_MODES[i]
+        if self.track_sort == "random":
+            self._random_order = []  # force un nouveau mélange (vrai "shuffle")
+        self.library.set_setting("track_sort", self.track_sort)
+        self.selected_index = 0
+        self.scroll_offset = 0
 
     def handle_state_playlists(self, key):
         playlists = self.cmds.list_playlists()
@@ -439,14 +570,18 @@ class UI:
                     self.cmds.sync_library()
                 else:
                     self.prompt_input("Invalid path. Press Enter to continue.")
-        elif self.selected_index == 2:
+        elif self.selected_index == 3:
+            folder = self.prompt_input("Export folder path: ")
+            if folder:
+                self.library.set_setting("export_folder", str(Path(folder).expanduser()))
+        elif self.selected_index == 4:
             current = self.library.get_setting("show_shortcuts") or "on"
             self.library.set_setting("show_shortcuts", "off" if current == "on" else "on")
-        elif self.selected_index == 3:
+        elif self.selected_index == 5:
             self.state = "controls"
             self.selected_index = 0
             self.scroll_offset = 0
-        elif self.selected_index == 4:
+        elif self.selected_index == 6:
             self.state = "main"
             self.selected_index = 0
             self.scroll_offset = 0
@@ -492,23 +627,31 @@ class UI:
         self.input_buffer = ""
         saved_state = self.state
         self.state = "input_prompt"
-        self.stdscr.nodelay(False)
-        self.stdscr.timeout(-1)
+        self.stdscr.nodelay(False)  # lecture bloquante le temps de la saisie
 
         while True:
             h, w = self.stdscr.getmaxyx()
             self.stdscr.clear()
             self.draw_current_track_box(0, 0, 5, w)
-            # Menu réduit pour laisser place à la zone de saisie
-            self.draw_menu_box(6, 0, h - 6, w)
+            # Menu réduit pour laisser place à la zone de saisie (3 lignes,
+            # de `by` à `by+2`). Il DOIT s'arrêter avant `by`, sinon le menu
+            # écrit un item juste sous la zone de saisie et le prompt (plus
+            # court) ne l'efface que partiellement — d'où du texte résiduel
+            # qui "traîne" jusqu'à être recouvert par la frappe suivante.
+            by = h - 4
+            menu_h = max(1, by - 6)
+            self._menu_visible_rows = self._visible_rows(menu_h, len(self.items))
+            self._clamp_scroll()
+            self.draw_menu_box(6, 0, menu_h, w)
             # Box de saisie en bas
             try:
-                by = h - 4
                 self.stdscr.addstr(by,     0, "+" + "-" * (w - 2) + "+")
                 self.stdscr.addstr(by + 1, 0, "|")
                 self.stdscr.addstr(by + 1, w - 1, "|")
-                text = f" {prompt}{self.input_buffer}"
-                self.stdscr.addstr(by + 1, 2, text[:w - 4])
+                # ljust : efface tout résidu au lieu de laisser les colonnes
+                # non écrites telles quelles (défense en profondeur).
+                text = f" {prompt}{self.input_buffer}"[:w - 4].ljust(w - 4)
+                self.stdscr.addstr(by + 1, 2, text)
                 self.stdscr.addstr(by + 2, 0, "+" + "-" * (w - 2) + "+")
             except curses.error:
                 pass
@@ -524,7 +667,6 @@ class UI:
                     result = self.input_buffer.strip()
                     self.state = saved_state
                     self.stdscr.nodelay(True)
-                    self.stdscr.timeout(100)
                     return result
                 elif key in ("\b", "\x7f"):
                     self.input_buffer = self.input_buffer[:-1]
@@ -535,8 +677,7 @@ class UI:
 
     def prompt_key(self, prompt: str):
         """Capture une seule touche pour le remapping. ESC annule."""
-        self.stdscr.nodelay(False)
-        self.stdscr.timeout(-1)
+        self.stdscr.nodelay(False)  # lecture bloquante le temps de la capture
         h, w = self.stdscr.getmaxyx()
         self.stdscr.clear()
         try:
@@ -559,7 +700,6 @@ class UI:
             pass
 
         self.stdscr.nodelay(True)
-        self.stdscr.timeout(100)
         return result
 
     # ---------------- END OF TRACK ---------------- #

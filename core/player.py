@@ -84,6 +84,10 @@ class Player:
         vol = max(0, min(100, vol + delta))
         self.player.audio_set_volume(vol)
 
+    def current_volume(self) -> int:
+        vol = self.player.audio_get_volume()
+        return max(0, min(100, vol if vol is not None else 0))
+
     def check_auto_next(self):
         """À appeler régulièrement pour passer au morceau suivant si terminé"""
         if self.state == "PLAYING" and self.current_duration() > 0:
