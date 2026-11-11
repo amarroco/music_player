@@ -10,6 +10,8 @@ class Player:
         self.playlist: List[Path] = []
         self.current_index: Optional[int] = None
         self.state = "STOPPED"  # STOPPED, PLAYING, PAUSED
+        self._volume = 100  # source de vérité côté Python : reste valide
+                             # même avant qu'un média ait été chargé dans VLC
 
     def set_playlist(self, tracks: List[Path], start_index: Optional[int] = 0):
         self.playlist = tracks
@@ -27,6 +29,13 @@ class Player:
         media = self.instance.media_new(str(track))
         self.player.set_media(media)
         self.player.play()
+        # Pas d'appel à audio_set_volume ici : play() est asynchrone et la
+        # sortie audio n'existe pas encore à cet instant précis — l'appeler
+        # trop tôt segfaulte libvlc (même famille de bug que le guard dans
+        # adjust_volume ci-dessous, juste décalée de quelques ms). Comme
+        # self.player est réutilisé d'un morceau à l'autre, le volume réglé
+        # via adjust_volume() pendant une lecture reste de toute façon
+        # appliqué aux morceaux suivants sans qu'on ait besoin de le refaire.
         self.state = "PLAYING"
 
     def pause(self):
@@ -78,15 +87,18 @@ class Player:
         new_pos = max(0, min(self.current_position() + seconds, dur))
         self.player.set_time(int(new_pos * 1000))
 
+    # États où la sortie audio n'existe pas encore (ou plus) côté libvlc :
+    # y toucher (audio_set_volume) y segfaulte. NothingSpecial = aucun média
+    # jamais chargé ; Opening = média en cours d'ouverture juste après play().
+    _UNSAFE_AUDIO_STATES = (vlc.State.NothingSpecial, vlc.State.Opening, vlc.State.Error)
+
     def adjust_volume(self, delta: int):
-        vol = self.player.audio_get_volume()
-        if vol < 0: vol = 0
-        vol = max(0, min(100, vol + delta))
-        self.player.audio_set_volume(vol)
+        self._volume = max(0, min(100, self._volume + delta))
+        if self.player.get_state() not in self._UNSAFE_AUDIO_STATES:
+            self.player.audio_set_volume(self._volume)
 
     def current_volume(self) -> int:
-        vol = self.player.audio_get_volume()
-        return max(0, min(100, vol if vol is not None else 0))
+        return self._volume
 
     def check_auto_next(self):
         """À appeler régulièrement pour passer au morceau suivant si terminé"""
