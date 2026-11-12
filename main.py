@@ -8,6 +8,7 @@ from cli.ui import UI
 def main():
     library = Library()
     player = Player()
+    player.edit_provider = library.get_track_edit
     cmds = Commands(library, player)
     ui = UI(library, player, cmds)
     ui.start()

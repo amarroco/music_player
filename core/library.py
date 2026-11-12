@@ -2,6 +2,7 @@
 import sqlite3
 from pathlib import Path
 from core.metadata import read_tags
+from core.models import TrackEdit
 
 
 class Library:
@@ -79,6 +80,18 @@ class Library:
             cursor.execute("ALTER TABLE playlist_tracks_new RENAME TO playlist_tracks")
             self.conn.commit()
 
+        # Migration : édition non destructive des morceaux (début/fin/gain)
+        cursor.execute("PRAGMA table_info(tracks)")
+        track_columns = [row[1] for row in cursor.fetchall()]
+        for column, ddl in (
+            ("start_ms", "INTEGER"),
+            ("end_ms", "INTEGER"),
+            ("gain_db", "REAL"),
+        ):
+            if column not in track_columns:
+                cursor.execute(f"ALTER TABLE tracks ADD COLUMN {column} {ddl}")
+        self.conn.commit()
+
     # ---------------- Tracks ---------------- #
 
     def add_folder(self, folder: Path):
@@ -104,6 +117,29 @@ class Library:
             self.conn.commit()
         except sqlite3.IntegrityError:
             pass  # déjà présent
+
+    def get_track_edit(self, path: Path) -> TrackEdit:
+        """Édition enregistrée pour ce fichier (TrackEdit par défaut si aucune)."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT start_ms, end_ms, gain_db FROM tracks WHERE path=?", (str(path),)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return TrackEdit()
+        return TrackEdit(
+            start_ms=row["start_ms"] or 0,
+            end_ms=row["end_ms"],
+            gain_db=row["gain_db"] or 0.0,
+        )
+
+    def set_track_edit(self, path: Path, edit: TrackEdit):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tracks SET start_ms=?, end_ms=?, gain_db=? WHERE path=?",
+            (edit.start_ms or None, edit.end_ms, edit.gain_db or None, str(path)),
+        )
+        self.conn.commit()
 
     def sync_missing_tracks(self):
         """Supprime de la BDD tous les tracks dont le fichier n'existe plus sur disque."""

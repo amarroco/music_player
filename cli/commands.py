@@ -10,6 +10,8 @@ from core.player import Player
 from core.library import Library
 from core.metadata import write_tags
 from core.downloader import download_mp3
+from core.audio_edit import bake_edit
+from core.models import TrackEdit
 
 
 class Commands:
@@ -48,6 +50,28 @@ class Commands:
             for r in cursor.fetchall()
         ]
 
+    def queue_tracks(self):
+        """Morceaux de la file de lecture (dans l'ordre de lecture), enrichis
+        des infos de la bibliothèque quand le fichier y est connu."""
+        by_path = {t["path"]: t for t in self.list_tracks()}
+        return [
+            by_path.get(path) or {"id": None, "title": path.stem, "artist": None,
+                                  "album": None, "path": path}
+            for path in self.player.playlist
+        ]
+
+    def track_info(self, path: Path):
+        """Infos de la bibliothèque pour un fichier (None si inconnu)."""
+        cursor = self.library.conn.cursor()
+        cursor.execute(
+            "SELECT id, title, artist, album, path FROM tracks WHERE path=?", (str(path),)
+        )
+        r = cursor.fetchone()
+        if not r:
+            return None
+        return {"id": r["id"], "title": r["title"], "artist": r["artist"],
+                "album": r["album"], "path": Path(r["path"])}
+
     def playlist_tracks(self, playlist_id):
         cursor = self.library.conn.cursor()
         cursor.execute("""
@@ -75,6 +99,7 @@ class Commands:
                 path.unlink()
         except Exception:
             pass
+        self.player.remove_path(path)  # sinon la file garde un fichier disparu
         cursor.execute("DELETE FROM playlist_tracks WHERE track_id=?", (track_id,))
         cursor.execute("DELETE FROM tracks WHERE id=?", (track_id,))
         self.library.conn.commit()
@@ -124,6 +149,62 @@ class Commands:
                 failed += 1
                 self.last_export_error = f"{Path(t['path']).name}: {e}"
         return copied, failed
+
+    @staticmethod
+    def _import_target(src: Path, dest: Path):
+        """Chemin de destination libre pour src, ou None si c'est un doublon."""
+        target = dest / src.name
+        n = 1
+        while target.exists():
+            if target.samefile(src) or target.stat().st_size == src.stat().st_size:
+                return None
+            target = dest / f"{src.stem} ({n}){src.suffix}"
+            n += 1
+        return target
+
+    def import_folder(self, src_folder: Path, progress=None):
+        """Copie les .mp3 de src_folder (récursif) dans le dossier musique et
+        les ajoute à la bibliothèque. progress(done, total) est appelé après
+        chaque fichier. Retourne (copiés, ignorés, échecs) ; un fichier de même
+        nom ET de même taille est un doublon (ignoré), de même nom mais de taille
+        différente est copié sous un nom suffixé."""
+        music_folder = self.library.get_setting("music_folder")
+        if not music_folder:
+            return 0, 0, 0
+        dest = Path(music_folder).expanduser()
+        dest.mkdir(parents=True, exist_ok=True)
+        files = sorted(f for f in Path(src_folder).rglob("*") if f.suffix.lower() == ".mp3")
+        copied = skipped = failed = 0
+        for done, src in enumerate(files, start=1):
+            try:
+                target = self._import_target(src, dest)
+                if target is None:
+                    skipped += 1
+                else:
+                    # copyfile et non copy2 : comme pour l'export, les montages
+                    # gvfs (afc, mtp...) refusent chmod/utime.
+                    shutil.copyfile(src, target)
+                    self.library.add_track(target)
+                    copied += 1
+            except Exception:
+                failed += 1
+            if progress:
+                progress(done, len(files))
+        return copied, skipped, failed
+
+    # ---------------- AUDIO EDIT (début/fin/gain) ---------------- #
+
+    def get_track_edit(self, path: Path) -> TrackEdit:
+        return self.library.get_track_edit(path)
+
+    def set_track_edit(self, path: Path, edit: TrackEdit):
+        self.library.set_track_edit(path, edit)
+
+    def bake_track_edit(self, path: Path):
+        """Applique définitivement l'édition au fichier (ffmpeg), puis la remet à zéro."""
+        edit = self.library.get_track_edit(path)
+        bake_edit(path, edit)
+        self.library.set_track_edit(path, TrackEdit())
 
     # ---------------- PLAYER CONTROL ---------------- #
 

@@ -16,6 +16,17 @@ def read_tags(file_path: Path):
     except Exception:
         return {}
 
+def read_cover(file_path: Path):
+    """Retourne les octets de la pochette ID3 (APIC), ou None s'il n'y en a pas."""
+    try:
+        apics = ID3(file_path).getall("APIC")
+    except Exception:
+        return None
+    if not apics:
+        return None
+    front = [a for a in apics if a.type == 3]  # 3 = cover front
+    return (front or apics)[0].data
+
 def write_tags(file_path: Path, title=None, artist=None, album=None, cover_path=None):
     """Modifie les tags ID3 et éventuellement la pochette"""
     audio = MP3(file_path, ID3=ID3)
