@@ -1,12 +1,9 @@
 # TODO
 fixes
-- [ ] clignotement (update ecran seulement quand nécessaire)
-- [ ] export sur téléphone (vers /run/user/1000/gvfs/afc*/org.videolan.vlc-ios)
-- [ ] pendant le téléchargement d'un mp3 via yt-dlp, afficher un buffer plutôt que le retour de yt-dlp
-- [ ] lors de la modification de métadonnée, préremplir l'entrée utilisateur par la valeur déjà existante (si il y en a une)
+- [ ] "show shortcuts" off ne devrait pas cacher le titre de la fenêtre (menu, tracks : tri)
 
 features
 - [ ] clic souris pour lancer
-- [ ] liste de lecture (ordre aléatoire)
 - [ ] édition des fichiers mp3 (couper début/fin, modifier le volume du morceau)
-- [ ] import
+- [ ] import (copie de .mp3 depuis un dossier)
+- [ ] raccourci pour réduire la fenêtre au "current track"

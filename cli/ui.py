@@ -99,6 +99,8 @@ class UI:
             self.state = "settings"
             self.first_launch = False
 
+        last_sig = None
+        dirty = True
         while self.running:
             # On vide entièrement le buffer clavier à chaque frame : si une
             # touche a été maintenue (auto-repeat), toutes ses répétitions
@@ -107,14 +109,32 @@ class UI:
             key = self.stdscr.getch()
             while key != -1:
                 self.handle_key(key)
+                dirty = True
                 key = self.stdscr.getch()
 
             self.player.check_auto_next()
-            self.stdscr.clear()
+            self.cmds.poll_download()
             h, w = self.stdscr.getmaxyx()
-            self.render_current_state(h, w)
-            self.stdscr.refresh()
+
+            # On ne redessine que si une touche a été traitée ou si ce qui est
+            # affiché a changé tout seul (seconde écoulée, volume, morceau,
+            # téléchargement, redimensionnement). erase() et non clear() :
+            # clear() force une repeinture complète du terminal (= clignotement),
+            # erase() laisse curses n'envoyer que les cases modifiées.
+            sig = self._render_signature(h, w)
+            if dirty or sig != last_sig:
+                self.stdscr.erase()
+                self.render_current_state(h, w)
+                self.stdscr.refresh()
+                last_sig = sig
+                dirty = False
             time.sleep(0.03)
+
+    def _render_signature(self, h, w):
+        p = self.player
+        return (h, w, int(p.current_position()), int(p.current_duration()),
+                p.current_volume(), p.current_index, p.state,
+                self.cmds.download_status)
 
     # ---------------- RENDER ---------------- #
 
@@ -264,6 +284,8 @@ class UI:
         vol_bar = "#" * (vol // 10) + "-" * (10 - vol // 10)
         pos_str = f"{int(pos)//60}:{int(pos)%60:02d} / {int(dur)//60}:{int(dur)%60:02d}"
         info_line = f"{pos_str}    Vol [{vol_bar}] {vol:3d}%"
+        if self.cmds.download_status:
+            info_line += f"    {self.cmds.download_status}"
 
         self._safe_addstr(y + 1, x + 2, track.stem if track else "No track playing")
         self._safe_addstr(y + 2, x + 2, bar)
@@ -441,11 +463,14 @@ class UI:
         if not tracks:
             self.prompt_input("No tracks to export. Press Enter to continue.")
             return
-        dest = Path(target_root).expanduser()
-        copied, failed = self.cmds.export_tracks(tracks, dest)
-        msg = f"Exported {copied} track(s) to {dest}"
-        if failed:
-            msg += f" ({failed} failed)"
+        copied, failed = self.cmds.export_tracks(tracks, target_root)
+        err = self.cmds.last_export_error
+        if copied == 0 and failed and err:
+            msg = f"Export failed: {err}"
+        else:
+            msg = f"Exported {copied} track(s) to {target_root}"
+            if failed:
+                msg += f" ({failed} failed: {err})"
         self.prompt_input(f"{msg}. Press Enter to continue.")
 
     def handle_state_tracks(self, key):
@@ -475,21 +500,23 @@ class UI:
                 self.scroll_offset = 0
         elif key in (ord("d"), ord("D")):
             url = self.prompt_input("YouTube URL: ")
-            if url:
-                self.cmds.download_youtube(url)
+            if url and not self.cmds.download_youtube(url):
+                self.prompt_input("Download not started (no music folder, or one already running). Press Enter to continue.")
         elif key in (ord("e"), ord("E")):
             self._edit_track(tracks[self.selected_index])
 
     def _edit_track(self, track):
         """Édite titre / artiste / cover d'un mp3 (laisser vide = ne pas changer)."""
-        title = self.prompt_input(f"Title [{track['title']}]: ")
-        artist = self.prompt_input(f"Artist [{track['artist'] or ''}]: ")
+        # Champs préremplis avec la valeur actuelle. Vide ou inchangé = on ne
+        # touche à rien (en particulier le titre actuel est toujours conservé).
+        title = self.prompt_input("Title: ", initial=track["title"] or "")
+        artist = self.prompt_input("Artist: ", initial=track["artist"] or "")
         cover = self.prompt_input("Cover image path (empty = keep current): ")
 
         updates = {}
-        if title:
+        if title and title != track["title"]:
             updates["title"] = title
-        if artist:
+        if artist and artist != (track["artist"] or ""):
             updates["artist"] = artist
         if cover:
             cover_path = Path(cover).expanduser()
@@ -622,16 +649,17 @@ class UI:
         if self.active_playlist and track:
             self.cmds.add_to_playlist(self.active_playlist["id"], track["id"])
 
-    def prompt_input(self, prompt: str) -> str:
-        """Saisie texte. Le bandeau raccourcis est masqué ; une box dédiée s'affiche."""
-        self.input_buffer = ""
+    def prompt_input(self, prompt: str, initial: str = "") -> str:
+        """Saisie texte, éventuellement préremplie avec `initial`. Le bandeau
+        raccourcis est masqué ; une box dédiée s'affiche."""
+        self.input_buffer = initial
         saved_state = self.state
         self.state = "input_prompt"
         self.stdscr.nodelay(False)  # lecture bloquante le temps de la saisie
 
         while True:
             h, w = self.stdscr.getmaxyx()
-            self.stdscr.clear()
+            self.stdscr.erase()
             self.draw_current_track_box(0, 0, 5, w)
             # Menu réduit pour laisser place à la zone de saisie (3 lignes,
             # de `by` à `by+2`). Il DOIT s'arrêter avant `by`, sinon le menu
@@ -650,7 +678,9 @@ class UI:
                 self.stdscr.addstr(by + 1, w - 1, "|")
                 # ljust : efface tout résidu au lieu de laisser les colonnes
                 # non écrites telles quelles (défense en profondeur).
-                text = f" {prompt}{self.input_buffer}"[:w - 4].ljust(w - 4)
+                full = f" {prompt}{self.input_buffer}"
+                # Texte long : on garde la fin, là où se trouve le curseur
+                text = (full[-(w - 4):] if len(full) > w - 4 else full).ljust(w - 4)
                 self.stdscr.addstr(by + 1, 2, text)
                 self.stdscr.addstr(by + 2, 0, "+" + "-" * (w - 2) + "+")
             except curses.error:
